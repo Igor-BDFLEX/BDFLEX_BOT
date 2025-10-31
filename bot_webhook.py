@@ -55,23 +55,34 @@ def initialize_firebase():
             logger.error("A variável de ambiente 'FIREBASE_CREDENTIALS_JSON' não está configurada.")
             return None
 
-        # 1. Tenta carregar o JSON de forma direta (mais limpa)
+        # --- Etapa 1: Carregamento do JSON ---
+        cred_dict = {}
         try:
+            # Tenta carregar o JSON de forma direta (mais limpa)
             cred_dict = json.loads(firebase_credentials_json)
             logger.info("Tentativa 1: JSON carregado diretamente.")
-        except json.JSONDecodeError:
-            # 2. Se falhar, tenta limpar a string (útil para quebras de linha ou caracteres de escape)
-            logger.warning("Tentativa 1 falhou. Tentando limpar e re-carregar o JSON...")
+        except json.JSONDecodeError as e:
+            # Se falhar, tenta limpar a string (útil para quebras de linha ou caracteres de escape)
+            logger.warning(f"Tentativa 1 falhou ao carregar o JSON: {e}. Tentando limpeza...")
             # Remove quebras de linha e tabs que podem ter sido inseridas no Render
             cleaned_json_string = firebase_credentials_json.replace('\n', '').replace('\t', '')
             
-            # Nota: Em alguns ambientes, aspas duplas internas podem ser duplicadas.
-            # Se o problema persistir, descomentar a linha abaixo pode ajudar:
-            # cleaned_json_string = cleaned_json_string.replace('""', '"')
+            try:
+                # Tenta carregar novamente após limpeza básica
+                cred_dict = json.loads(cleaned_json_string)
+                logger.info("Tentativa 2: JSON carregado após limpeza.")
+            except json.JSONDecodeError as e_clean:
+                # Se ainda falhar, algo fundamental está errado com a string.
+                raise ValueError(f"Falha ao carregar JSON após todas as tentativas de limpeza: {e_clean}")
 
-            cred_dict = json.loads(cleaned_json_string)
-            logger.info("Tentativa 2: JSON carregado após limpeza.")
+
+        # --- Etapa 2: Validação Agressiva da Credencial (Onde o erro está ocorrendo) ---
         
+        # Se o json.loads funcionar, mas o Firebase falhar, o problema é no conteúdo do dicionário.
+        if cred_dict.get("type") != "service_account":
+            logger.error(f"O campo 'type' no JSON carregado é '{cred_dict.get('type')}', mas deveria ser 'service_account'.")
+            raise ValueError("O JSON da credencial é inválido. Falta ou está incorreto o campo 'type'.")
+
         # O certificado é criado a partir do dicionário Python (cred_dict)
         cred = credentials.Certificate(cred_dict)
         
@@ -82,9 +93,10 @@ def initialize_firebase():
 
     except Exception as e:
         logger.error(f"Erro na inicialização do Firebase: {e}")
-        # Se for o erro específico de certificado inválido, loga a dica
-        if "Certificate must contain a \"type\" field set to \"service_account\"" in str(e):
-             logger.error("DICA: Este erro geralmente indica que o valor de 'FIREBASE_CREDENTIALS_JSON' está com formatação incorreta (ex: aspas extras, espaços no final) no Render.")
+        # Loga a dica mais específica
+        if "Certificate must contain a \"type\" field set to \"service_account\"" in str(e) or "O JSON da credencial é inválido" in str(e):
+             logger.error("DICA FINAL: Este erro é SEMPRE causado por caracteres invisíveis, aspas extras, ou quebras de linha corrompendo a estrutura da credencial na variável 'FIREBASE_CREDENTIALS_JSON' no Render.")
+             logger.error("A RECOMENDAÇÃO é gerar uma NOVA chave de conta de serviço no Firebase e colá-la cuidadosamente no Render.")
         return None
 
 # Variável global para o cliente Firestore

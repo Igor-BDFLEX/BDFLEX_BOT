@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue,webhooks]>=21.0.1
+firebase-admin
+google-cloud-firestore
+python-dotenv
+aiohttp

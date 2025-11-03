@@ -35,6 +35,8 @@ except ImportError:
     PDF_PROCESSOR_AVAILABLE = False
     class MockDataFrame: # Placeholder para evitar erros
         def __init__(self, *args, **kwargs): pass
+        def to_csv(self, *args, **kwargs): pass
+        def from_dict(self, *args, **kwargs): return self
     pd = MockDataFrame()
 
 # Firebase
@@ -51,1265 +53,1279 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
     ConversationHandler,
-    JobQueue,
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode
 
 # --- Configuração ---
-
-# Carrega variáveis de ambiente (do arquivo .env, se existir)
-load_dotenv()
-
-# Obtém variáveis de ambiente (o TOKEN e WEBHOOK_URL são obrigatórios)
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Ex: https://sua-app.exemplo.com
-WEBHOOK_PATH = "/" + TOKEN # Caminho do webhook
-PORT = int(os.getenv("PORT", 8080)) # Porta para o webhook
-
-if not TOKEN or not WEBHOOK_URL:
-    # Se estiver rodando em ambiente local de teste, esta verificação pode ser relaxada
-    # mas é crucial para o Webhook.
-    logging.error("Variáveis de ambiente TELEGRAM_TOKEN e WEBHOOK_URL devem estar definidas.")
 
 # Habilita o logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-# Reduz o nível de log de bibliotecas externas
+# Define níveis de log mais altos para bibliotecas que usam muito log
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("firebase_admin").setLevel(logging.WARNING)
-logging.getLogger("google.auth").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-# Estados para o ConversationHandler
-MENU, PROMPT_OS, PROMPT_DESCRICAO, PROMPT_TIPO, PROMPT_STATUS, PROMPT_ATUALIZACAO, PROMPT_ALERTA, PROMPT_INCLUSAO, PROMPT_ID_ALERTA, PROMPT_TIPO_INCLUSAO, LEMBRETE_MENU, PROMPT_ID_LEMBRETE, PROMPT_LEMBRETE_DATA, PROMPT_LEMBRETE_MSG = range(14)
+# Carrega variáveis de ambiente (útil para desenvolvimento local)
+load_dotenv()
+
+# --- Variáveis de Ambiente ---
+# A Render define a porta (PORT) e pode definir a URL pública (RENDER_EXTERNAL_URL)
+PORT = int(os.environ.get("PORT", "8080")) 
+# Prioriza WEBHOOK_URL (se definido), senão usa RENDER_EXTERNAL_URL (padrão Render)
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+WEBHOOK_PATH = "/" + TOKEN if TOKEN else "/webhook" # O caminho usa o token para segurança
 
 # --- Firebase Init ---
 
-# Inicializa o Firebase (Prioriza variável de ambiente JSON ou fallback para arquivo local)
-try:
-    # Tenta carregar as credenciais diretamente de uma variável de ambiente JSON
-    firebase_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")
-    if firebase_json_str:
-        cred_dict = json.loads(firebase_json_str)
-        cred = credentials.Certificate(cred_dict)
-        logger.info("Credenciais do Firebase carregadas de FIREBASE_CREDENTIALS_JSON.")
-    else:
-        # Tenta carregar o arquivo local app.json
-        cred = credentials.Certificate("app.json")
-        logger.info("Credenciais do Firebase carregadas de app.json (caminho local).")
-    
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    logger.info("Firebase inicializado com sucesso.")
+DB = None
+FIREBASE_INITIALIZED = False
 
-except Exception as e:
-    logger.error(f"Falha ao inicializar o Firebase: {e}")
-    # Cria um mock db para evitar crashes caso o Firebase falhe na inicialização
-    class MockDB:
-        def collection(self, *args): return self
-        def document(self, *args): return self
-        def get(self): return type('MockDoc', (object,), {'exists': False, 'to_dict': lambda: {}})()
-        def stream(self): return []
-        def where(self, *args): return self
-        def order_by(self, *args): return self
-        def limit(self, *args): return self
-        def set(self, *args): pass
-        def update(self, *args): pass
-        def delete(self): pass
-        def add(self, *args): return (None, type('MockDocRef', (object,), {'id': 'mock-id'})())
-    db = MockDB()
-    logger.warning("Usando banco de dados mock. Funcionalidade de persistência está desativada.")
+# Função para inicializar o Firebase
+def firebase_init():
+    global DB, FIREBASE_INITIALIZED
     
-# --- Utils Firebase ---
+    # Se já inicializado, apenas retorna
+    if FIREBASE_INITIALIZED:
+        return
+        
+    try:
+        # 1. Tenta carregar as credenciais da variável de ambiente FIREBASE_CREDENTIALS (Render)
+        credentials_json_str = os.getenv("FIREBASE_CREDENTIALS")
+
+        if credentials_json_str:
+            cred_dict = json.loads(credentials_json_str)
+            
+            # CORREÇÃO CRÍTICA PARA O ERRO PEM: 
+            # Assegura que a chave privada contém quebras de linha reais (\n) 
+            # em vez de strings literais ('\\n'), o que é comum em variáveis de ambiente.
+            if 'private_key' in cred_dict and '\\n' in cred_dict['private_key']:
+                cred_dict['private_key'] = cred_dict['private_key'].replace('\\n', '\n')
+            
+            cred = credentials.Certificate(cred_dict)
+            
+        else:
+            logger.error("Variável de ambiente 'FIREBASE_CREDENTIALS' não encontrada.")
+            raise ValueError("Credenciais de Firebase ausentes.")
+
+        # Inicializa o Firebase
+        initialize_app(cred)
+        DB = firestore.client()
+        FIREBASE_INITIALIZED = True
+        logger.info("Firebase inicializado com sucesso usando credenciais de ambiente.")
+
+    except Exception as e:
+        logger.error(f"Falha ao inicializar o Firebase: {e}")
+        logger.warning("Usando banco de dados mock. Funcionalidade de persistência está desativada.")
+        DB = None
+        FIREBASE_INITIALIZED = False
+
+# Chamada de inicialização
+firebase_init()
+
+# --- Helpers de Persistência (Firestore ou Mock) ---
+
+def get_db():
+    """Retorna o objeto DB ou levanta um erro se não estiver inicializado."""
+    if not FIREBASE_INITIALIZED or DB is None:
+        return None
+    return DB
 
 def get_os_ref(os_id: str):
-    """Retorna a referência do documento OS no Firestore."""
-    return db.collection("ordens_servico").document(os_id)
+    """Retorna a referência de um documento OS."""
+    db = get_db()
+    if db:
+        return db.collection("ordens_servico").document(os_id)
+    return None
 
-def get_alertas_ref():
-    """Retorna a referência da coleção de Alertas/Lembretes no Firestore."""
-    return db.collection("alertas_lembretes")
+def get_alerts_ref():
+    """Retorna a referência da coleção de alertas."""
+    db = get_db()
+    if db:
+        return db.collection("alertas")
+    return None
 
-def get_all_os():
-    """Retorna todas as OS ativas (status != 'Concluída')."""
+async def fetch_all_os() -> dict:
+    """Busca todas as Ordens de Serviço."""
+    db = get_db()
+    if db is None:
+        return {} # Mock
     try:
-        # Nota: O Firestore não permite consultas em diferentes campos em '!=', '!in' ou 'not_in'.
-        docs = db.collection("ordens_servico").where("status", "!=", "Concluída").stream()
-        return [doc.to_dict() | {"id": doc.id} for doc in docs]
+        docs = db.collection("ordens_servico").stream()
+        os_list = {doc.id: doc.to_dict() for doc in docs}
+        return os_list
     except Exception as e:
         logger.error(f"Erro ao buscar todas as OS: {e}")
-        return []
+        return {}
 
-def get_os_by_id(os_id: str):
-    """Retorna uma OS pelo ID."""
+async def save_os(os_data: dict) -> str:
+    """Salva ou atualiza uma Ordem de Serviço."""
+    db = get_db()
+    if db is None:
+        return str(uuid.uuid4()) # Mock ID
+    
+    os_id = os_data.get("id")
+    if not os_id:
+        os_id = str(uuid.uuid4())
+        os_data["id"] = os_id
+        os_data["data_criacao"] = datetime.now().isoformat()
+    
     try:
-        doc = get_os_ref(os_id).get()
-        if doc.exists:
-            return doc.to_dict() | {"id": doc.id}
-        return None
+        ref = db.collection("ordens_servico").document(os_id)
+        await asyncio.to_thread(ref.set, os_data)
+        return os_id
     except Exception as e:
-        logger.error(f"Erro ao buscar OS {os_id}: {e}")
+        logger.error(f"Erro ao salvar OS {os_id}: {e}")
+        return os_id
+
+async def delete_os(os_id: str) -> bool:
+    """Deleta uma Ordem de Serviço e seus alertas associados."""
+    db = get_db()
+    if db is None:
+        return True # Mock Success
+
+    try:
+        # 1. Deletar a OS
+        os_ref = db.collection("ordens_servico").document(os_id)
+        await asyncio.to_thread(os_ref.delete)
+        
+        # 2. Deletar alertas associados (opcional, mas recomendado)
+        alerts_ref = db.collection("alertas")
+        q = alerts_ref.where("os_id", "==", os_id).stream()
+        
+        for doc in q:
+            await asyncio.to_thread(doc.reference.delete)
+            
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar OS {os_id} e/ou alertas: {e}")
+        return False
+
+# --- Helpers de Alerta (Lembrete) ---
+
+async def schedule_alert(os_id: str, chat_id: int, due_date: datetime, message: str) -> str:
+    """Agenda um novo alerta no Firestore."""
+    db = get_db()
+    alert_id = str(uuid.uuid4())
+    alert_data = {
+        "id": alert_id,
+        "os_id": os_id,
+        "chat_id": chat_id,
+        "due_date": due_date.isoformat(),
+        "message": message,
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+    }
+    
+    if db is None:
+        return alert_id # Mock
+    
+    try:
+        ref = db.collection("alertas").document(alert_id)
+        await asyncio.to_thread(ref.set, alert_data)
+        return alert_id
+    except Exception as e:
+        logger.error(f"Erro ao agendar alerta: {e}")
+        return alert_id
+        
+async def fetch_alert(alert_id: str) -> dict | None:
+    """Busca um alerta específico."""
+    db = get_db()
+    if db is None:
+        return None
+    try:
+        ref = db.collection("alertas").document(alert_id)
+        doc = await asyncio.to_thread(ref.get)
+        return doc.to_dict() if doc.exists else None
+    except Exception as e:
+        logger.error(f"Erro ao buscar alerta {alert_id}: {e}")
         return None
 
-# --- Utils de Formatação ---
+async def delete_alert(alert_id: str) -> bool:
+    """Deleta um alerta específico."""
+    db = get_db()
+    if db is None:
+        return True # Mock
+    try:
+        ref = db.collection("alertas").document(alert_id)
+        await asyncio.to_thread(ref.delete)
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao deletar alerta {alert_id}: {e}")
+        return False
 
-def format_os_details(os_data: dict) -> str:
-    """Formata os detalhes de uma OS para exibição."""
-    os_id = os_data.get('id', 'N/A')
-    data_criacao = os_data.get('data_criacao', 'N/A')
+# --- Estados para o ConversationHandler ---
+MENU, PROMPT_OS, PROMPT_DESCRICAO, PROMPT_TIPO, PROMPT_STATUS, PROMPT_ATUALIZACAO, PROMPT_ALERTA, PROMPT_INCLUSAO, PROMPT_ID_ALERTA, PROMPT_TIPO_INCLUSAO, LEMBRETE_MENU, PROMPT_ID_LEMBRETE, PROMPT_LEMBRETE_DATA, PROMPT_LEMBRETE_MSG = range(14)
+
+# --- Funções de Formatação ---
+
+def format_os_message(os_data: dict) -> str:
+    """Formata os dados da OS para exibição no Telegram."""
+    if not os_data:
+        return "OS não encontrada."
+
+    id_os = os_data.get("id", "N/A")
+    descricao = os_data.get("descricao", "N/A")
+    tipo = os_data.get("tipo", "N/A")
+    status = os_data.get("status", "N/A")
+    criacao = os_data.get("data_criacao", "N/A")
+    atualizacao = os_data.get("ultima_atualizacao", "N/A")
+    alerta = os_data.get("alerta", "N/A")
     
-    # Formatar timestamp para string legível
-    data_str = "N/A"
-    if isinstance(data_criacao, datetime):
-        data_str = data_criacao.strftime("%d/%m/%Y %H:%M")
-    elif data_criacao and hasattr(data_criacao, 'seconds'): # Firestore Timestamp object
-        data_str = datetime.fromtimestamp(data_criacao.seconds).strftime("%d/%m/%Y %H:%M")
-    else:
-        data_str = str(data_criacao)
+    # Formata a data de criação
+    try:
+        data_criacao = datetime.fromisoformat(criacao).strftime("%d/%m/%Y %H:%M")
+    except (ValueError, TypeError):
+        data_criacao = criacao
         
-    alerta_info = ""
-    alerta_data = os_data.get('alerta_data')
-    alerta_desc = os_data.get('alerta_descricao')
+    # Formata a última atualização
+    try:
+        data_atualizacao = datetime.fromisoformat(atualizacao).strftime("%d/%m/%Y %H:%M") if atualizacao != "N/A" else "N/A"
+    except (ValueError, TypeError):
+        data_atualizacao = atualizacao
+
     
-    if alerta_data:
-        alerta_dt_obj = datetime.fromtimestamp(alerta_data.seconds)
-        alerta_info = f"\n🚨 *Alerta Agendado:*\n`{alerta_dt_obj.strftime('%d/%m/%Y %H:%M')}`\n*Descrição Alerta:* {alerta_desc or 'N/A'}"
-        
     message = (
-        f"🛠️ *Detalhes da Ordem de Serviço*\n\n"
-        f"🔗 *ID:* `{os_id}`\n"
-        f"📝 *Descrição:* {os_data.get('descricao', 'N/A')}\n"
-        f"🏷️ *Tipo:* `{os_data.get('tipo', 'N/A')}`\n"
-        f"🟢 *Status:* *{os_data.get('status', 'N/A')}*\n"
-        f"📅 *Data Criação:* `{data_str}`\n"
-        f"👤 *Criado Por (Chat ID):* `{os_data.get('user_id', 'N/A')}`\n"
-        f"{alerta_info}"
+        f"🛠️ *Detalhes da Ordem de Serviço (OS)*\n"
+        f"--- \n"
+        f"*ID:* `{id_os}`\n"
+        f"*Descrição:* {descricao}\n"
+        f"*Tipo:* {tipo}\n"
+        f"*Status:* {status}\n"
+        f"--- \n"
+        f"*Data de Criação:* {data_criacao}\n"
+        f"*Última Atualização:* {data_atualizacao}\n"
+        f"*Alerta Agendado:* {alerta}\n"
     )
     return message
 
-def parse_time_input(time_str: str) -> datetime | None:
-    """Tenta analisar a string de data/hora (DD/MM/YYYY HH:MM ou formato relativo)."""
-    time_str = time_str.strip().lower()
-    now = datetime.now()
+def get_main_menu_keyboard(update: Update) -> InlineKeyboardMarkup:
+    """Cria o teclado do menu principal."""
+    keyboard = [
+        [
+            InlineKeyboardButton("➕ Nova OS", callback_data='menu|nova_os'),
+            InlineKeyboardButton("🔎 Ver OS", callback_data='menu|ver_os'),
+        ],
+        [
+            InlineKeyboardButton("🔄 Atualizar OS", callback_data='menu|atualizar_os'),
+            InlineKeyboardButton("❌ Deletar OS", callback_data='menu|deletar_os'),
+        ],
+        [
+            InlineKeyboardButton("🔔 Gestão de Alertas", callback_data='menu|alerta_menu'),
+            InlineKeyboardButton("PDF 📄", callback_data='menu|exportar_pdf'),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-    # 1. Formato absoluto DD/MM/YYYY HH:MM
-    try:
-        return datetime.strptime(time_str, "%d/%m/%Y %H:%M")
-    except ValueError:
-        pass
-
-    # 2. Formato relativo (e.g., "+3h", "1d", "amanha 10:00")
-    if time_str.startswith('+'):
-        match = re.match(r"\+(\d+)([hdm])", time_str)
-        if match:
-            value = int(match.group(1))
-            unit = match.group(2)
-            if unit == 'h':
-                return now + timedelta(hours=value)
-            elif unit == 'd':
-                return now + timedelta(days=value)
-            elif unit == 'm':
-                return now + timedelta(minutes=value)
-    elif time_str.startswith('amanha'):
-        try:
-            time_part = time_str.split(' ')[1]
-            hours, minutes = map(int, time_part.split(':'))
-            tomorrow = now + timedelta(days=1)
-            # Retorna a data de amanhã com a hora especificada
-            return tomorrow.replace(hour=hours, minute=minutes, second=0, microsecond=0)
-        except Exception:
-            pass
-
-    return None
-
-# --- Handlers Básicos ---
+# --- Handlers Principais ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Inicia a conversa, exibe o menu principal."""
-    # Garante que o usuário esteja logado ou em um contexto de chat
-    if update.effective_user:
-        user = update.effective_user
-        if update.message:
-            await update.message.reply_chat_action(ChatAction.TYPING)
-            await update.message.reply_text(
-                f"Olá, {user.first_name}! Bem-vindo ao Gestor de Ordens de Serviço (OS).",
-                reply_markup=menu_keyboard()
-            )
-        elif update.callback_query:
-            query = update.callback_query
-            await query.answer()
-            await query.edit_message_text(
-                "Menu Principal:",
-                reply_markup=menu_keyboard()
-            )
-        
-    return MENU
-
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handler para o botão 'Voltar ao Menu'."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "Menu Principal:",
-        reply_markup=menu_keyboard()
-    )
+    """Inicia a conversa e exibe o menu principal."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            text="Bem-vindo ao Gerenciador de OS!\nEscolha uma opção:",
+            reply_markup=get_main_menu_keyboard(update),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text(
+            "Olá! Eu sou o seu bot para gestão de Ordens de Serviço (OS).",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await update.message.reply_text(
+            "Escolha uma opção no menu:",
+            reply_markup=get_main_menu_keyboard(update),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
     return MENU
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancela a conversa atual (ConversationHandler)."""
-    if update.message:
-        await update.message.reply_text(
-            'Operação cancelada. Voltando ao Menu Principal.', 
-            reply_markup=menu_keyboard()
+    """Cancela a conversa atual e volta ao menu."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "Operação cancelada. Voltando ao menu principal.",
+            reply_markup=get_main_menu_keyboard(update),
+            parse_mode=ParseMode.MARKDOWN
         )
-    # Limpa estados temporários
-    context.user_data.clear()
-    return MENU
-
-async def fallback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Responde a comandos não reconhecidos."""
-    if update.message:
+    else:
         await update.message.reply_text(
-            "Comando não reconhecido. Por favor, use um dos botões do menu ou /cancel."
+            "Operação cancelada. Voltando ao menu principal.",
+            reply_markup=get_main_menu_keyboard(update),
+            parse_mode=ParseMode.MARKDOWN
         )
     return MENU
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
-    """Trata todos os CallbackQueries que não são específicos de outros handlers."""
-    query = update.callback_query
-    data = query.data
-    
-    # Lógica de Navegação
-    if data == 'menu':
-        await menu_callback(update, context)
-        return MENU
-    
-    # Lógica de Ações de OS (View, Update, Delete vindo do menu de listagem)
-    if data.startswith('view_os_') or data.startswith('update_os_') or data.startswith('delete_os_'):
-        try:
-            _, action, os_id = data.split('_')
-        except ValueError:
-            logger.error(f"Callback data inválido: {data}")
-            await query.answer("Erro ao processar a ação.")
-            return MENU
+# --- Funções de Criação de OS ---
 
-        if action == 'view':
-            await view_os_details(update, context, os_id)
-            return MENU
-        elif action == 'update':
-            await prompt_update_status(update, context, os_id)
-            return PROMPT_STATUS
-        elif action == 'delete':
-            await delete_os_confirm(update, context, os_id)
-            return MENU
-
-    # Lógica de Submenus e Ações
-    elif data == 'gerenciar_alertas_menu':
-        await gerenciar_alertas_menu(update, context)
-        return PROMPT_ALERTA
-    elif data == 'remover_alerta_menu':
-        await remover_alerta_menu_start(update, context)
-        return PROMPT_ID_ALERTA
-    elif data == 'alerta_existente':
-        await query.answer("Você deve digitar um ID de OS válido ou voltar ao menu.")
-        return None
-    elif data == 'lembrete_menu':
-        await lembrete_menu(update, context)
-        return LEMBRETE_MENU
-    elif data == 'lembrete_manual_start':
-        # O fluxo de lembrete manual agora começa pedindo a data (PROMPT_LEMBRETE_DATA)
-        await prompt_lembrete_os_id(update, context)
-        return PROMPT_LEMBRETE_DATA
-    elif data == 'exportar_pdf':
-        await exportar_os_para_pdf(update, context)
-        return MENU
-    elif data.startswith('confirm_delete_'):
-        await confirm_delete_os(update, context)
-        return MENU
-        
-    return None
-
-# --- Teclados ---
-
-def menu_keyboard() -> InlineKeyboardMarkup:
-    """Teclado do menu principal."""
-    keyboard = [
-        [InlineKeyboardButton("➕ Nova OS", callback_data="criar_os")],
-        [InlineKeyboardButton("👀 Ver OS Ativas", callback_data="ver_ativas")],
-        [InlineKeyboardButton("✏️ Atualizar Status OS", callback_data="atualizar_status_os")],
-        [InlineKeyboardButton("⏰ Gerenciar Alertas OS", callback_data="gerenciar_alertas_menu")],
-        [InlineKeyboardButton("🗓 Agendar Lembrete Manual", callback_data="lembrete_menu")],
-        [InlineKeyboardButton("📤 Exportar para PDF", callback_data="exportar_pdf")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def os_actions_keyboard(os_id: str) -> InlineKeyboardMarkup:
-    """Teclado com ações para uma OS específica (após visualização)."""
-    keyboard = [
-        [
-            InlineKeyboardButton("✏️ Atualizar Status", callback_data=f"update_os_{os_id}"),
-            InlineKeyboardButton("❌ Excluir", callback_data=f"delete_os_{os_id}"),
-        ],
-        [InlineKeyboardButton("⏰ Gerenciar Alerta", callback_data=f"gerenciar_alerta_{os_id}")],
-        [InlineKeyboardButton("↩️ Voltar ao Menu", callback_data="menu")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def status_options_keyboard(os_id: str) -> InlineKeyboardMarkup:
-    """Teclado com as opções de status."""
-    keyboard = [
-        [
-            InlineKeyboardButton("Pendente", callback_data=f"set_status_{os_id}_Pendente"),
-            InlineKeyboardButton("Em Andamento", callback_data=f"set_status_{os_id}_Em Andamento"),
-        ],
-        [
-            InlineKeyboardButton("Aguardando Peças", callback_data=f"set_status_{os_id}_Aguardando Peças"),
-            InlineKeyboardButton("Concluída", callback_data=f"set_status_{os_id}_Concluída"),
-        ],
-        [InlineKeyboardButton("↩️ Voltar ao Menu", callback_data="menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def alerta_options_keyboard(os_id: str) -> InlineKeyboardMarkup:
-    """Teclado de opções de alerta (incluir/remover)."""
-    keyboard = [
-        [InlineKeyboardButton("➕ Incluir Alerta", callback_data=f"incluir_alerta_{os_id}")],
-        [InlineKeyboardButton("➖ Remover Alerta", callback_data=f"remover_alerta_{os_id}")],
-        [InlineKeyboardButton("↩️ Voltar ao Menu", callback_data="menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-# --- Fluxo de Criação de OS ---
-
-async def criar_os(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Inicia o fluxo de criação de OS, pedindo a descrição."""
-    query = update.callback_query
-    await query.answer()
-    
-    # Usa o ID do chat para enviar mensagens futuras
-    user_id = str(query.from_user.id)
-    chat_id = query.message.chat_id
-    
-    await query.edit_message_text(
-        "Certo. Por favor, **digite a descrição completa** da nova Ordem de Serviço (OS):",
+async def prompt_os_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pede a descrição da nova OS."""
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        "Por favor, digite a *descrição* detalhada da nova Ordem de Serviço:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='menu')]]),
         parse_mode=ParseMode.MARKDOWN
     )
-    context.user_data['os_data'] = {'user_id': user_id, 'chat_id': chat_id}
     return PROMPT_DESCRICAO
 
-async def receive_descricao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe a descrição e pede o tipo de OS."""
-    context.user_data['os_data']['descricao'] = update.message.text.strip()
+async def receive_os_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe a descrição e pede o tipo."""
+    context.user_data["os_temp"] = {"descricao": update.text}
     
     keyboard = [
-        [InlineKeyboardButton("Instalação", callback_data="tipo_Instalação")],
-        [InlineKeyboardButton("Manutenção", callback_data="tipo_Manutenção")],
-        [InlineKeyboardButton("Configuração", callback_data="tipo_Configuração")],
-        [InlineKeyboardButton("Outro", callback_data="tipo_Outro")]
+        [InlineKeyboardButton("Manutenção", callback_data='os_tipo|Manutenção')],
+        [InlineKeyboardButton("Instalação", callback_data='os_tipo|Instalação')],
+        [InlineKeyboardButton("Suporte", callback_data='os_tipo|Suporte')],
+        [InlineKeyboardButton("Outro", callback_data='os_tipo|Outro')],
+        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='menu')],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    
     await update.message.reply_text(
-        "Descrição recebida. Agora, selecione o *Tipo* de serviço:",
-        reply_markup=reply_markup,
+        "Qual é o *tipo* desta OS?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
     return PROMPT_TIPO
 
-async def receive_tipo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe o tipo e salva a OS com status 'Pendente', voltando ao menu."""
+async def receive_os_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe o tipo e salva a OS com status inicial 'Pendente'."""
     query = update.callback_query
     await query.answer()
     
-    try:
-        tipo = query.data.split('_')[1]
-    except IndexError:
-        await query.edit_message_text("❌ Opção de tipo inválida. Voltando ao menu.", reply_markup=menu_keyboard())
-        context.user_data.clear()
-        return MENU
-        
-    context.user_data['os_data']['tipo'] = tipo
-    context.user_data['os_data']['status'] = "Pendente"
-    context.user_data['os_data']['data_criacao'] = firestore.SERVER_TIMESTAMP
-
-    try:
-        # Salva no Firestore
-        doc_ref = db.collection("ordens_servico").add(context.user_data['os_data'])[1]
-        os_id = doc_ref.id
-        
-        await query.edit_message_text(
-            f"✅ *OS Criada com Sucesso!*\n\nID da OS: `{os_id}`\nTipo: {tipo}\nStatus: Pendente",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        logger.error(f"Erro ao salvar OS no Firebase: {e}")
-        await query.edit_message_text(
-            "❌ *Erro ao criar a OS*. Tente novamente.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
+    # Extrai o tipo
+    # A estrutura do callback_data é 'os_tipo|TipoEscolhido'
+    tipo = query.data.split('|')[1]
     
-    context.user_data.clear()
-    return MENU
-
-# --- Fluxo de Visualização e Atualização de OS ---
-
-async def ver_ativas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Exibe uma lista de todas as OS ativas (não concluídas)."""
-    query = update.callback_query
-    await query.answer()
+    os_data = context.user_data["os_temp"]
+    os_data["tipo"] = tipo
+    os_data["status"] = "Pendente"
+    os_data["ultima_atualizacao"] = datetime.now().isoformat()
+    os_data["alerta"] = "Nenhum"
+    os_data["user_id"] = query.from_user.id
     
-    await query.edit_message_text("👀 Buscando Ordens de Serviço Ativas...", reply_markup=menu_keyboard())
+    # Salva no Firestore
+    os_id = await save_os(os_data)
     
-    ordens = get_all_os()
+    # Limpa dados temporários
+    context.user_data.pop("os_temp")
     
-    if not ordens:
-        await query.edit_message_text(
-            "🎉 Nenhuma Ordem de Serviço Ativa encontrada.",
-            reply_markup=menu_keyboard()
-        )
-        return MENU
-
-    # Cria botões para cada OS
-    keyboard = []
-    for os in ordens:
-        descricao_curta = os.get('descricao', 'Sem Descrição')[:50].replace('\n', ' ')
-        button_text = f"🔗 {os['id']} | {os['status']} | {descricao_curta}..."
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"view_os_{os['id']}")])
-        
-    keyboard.append([InlineKeyboardButton("↩️ Voltar ao Menu", callback_data="menu")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        "🛠️ *Ordens de Serviço Ativas* (clique para ver detalhes/editar):",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-    return MENU
-
-async def view_os_details(update: Update, context: ContextTypes.DEFAULT_TYPE, os_id: str):
-    """Exibe os detalhes de uma OS."""
-    query = update.callback_query
-    await query.answer()
-    
-    os_data = get_os_by_id(os_id)
-    
-    if not os_data:
-        await query.edit_message_text(
-            f"❌ OS com ID `{os_id}` não encontrada.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return MENU
-
-    message = format_os_details(os_data)
-    
-    await query.edit_message_text(
-        message,
-        reply_markup=os_actions_keyboard(os_id),
-        parse_mode=ParseMode.MARKDOWN
+    message_text = (
+        f"✅ *OS Criada com Sucesso!*\n"
+        f"--- \n"
+        f"*ID:* `{os_id}`\n"
+        f"*Descrição:* {os_data['descricao'][:50]}...\n"
+        f"*Tipo:* {tipo}\n"
+        f"*Status:* Pendente\n"
     )
     
-async def atualizar_status_os(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Inicia o fluxo de atualização de status, pedindo o ID da OS."""
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        "Certo. Por favor, **digite o ID** da Ordem de Serviço (OS) que deseja atualizar o status:",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    return PROMPT_OS
-
-async def prompt_update_status(update: Update, context: ContextTypes.DEFAULT_TYPE, os_id: str | None = None) -> int:
-    """Recebe o ID da OS e pede o novo status."""
-    if os_id is None:
-        # Veio do fluxo de texto (PROMPT_OS)
-        if update.message:
-            os_id = update.message.text.strip()
-        else:
-            return PROMPT_OS
-        
-    context.user_data['target_os_id'] = os_id
-    
-    os_data = get_os_by_id(os_id)
-    
-    if not os_data:
-        msg = f"❌ OS com ID `{os_id}` não encontrada. Digite um ID válido ou /cancel."
-        if update.message:
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-            return PROMPT_OS
-        elif update.callback_query:
-            await update.callback_query.edit_message_text(msg, reply_markup=menu_keyboard(), parse_mode=ParseMode.MARKDOWN)
-            return MENU
-
-    msg = (
-        f"OS encontrada (ID: `{os_id}`, Status Atual: *{os_data['status']}*).\n\n"
-        f"Selecione o novo Status:"
-    )
-
-    if update.message:
-        await update.message.reply_text(
-            msg,
-            reply_markup=status_options_keyboard(os_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    elif update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text(
-            msg,
-            reply_markup=status_options_keyboard(os_id),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    return PROMPT_STATUS
-
-async def set_new_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Atualiza o status da OS no Firebase."""
-    query = update.callback_query
-    await query.answer()
-    
-    try:
-        _, _, os_id, new_status = query.data.split('_')
-    except ValueError:
-        await query.edit_message_text("❌ Erro ao processar a mudança de status. Tente novamente.", reply_markup=menu_keyboard())
-        context.user_data.clear()
-        return MENU
-    
-    try:
-        get_os_ref(os_id).update({"status": new_status, "data_atualizacao": firestore.SERVER_TIMESTAMP})
-        
-        await query.edit_message_text(
-            f"✅ Status da OS `{os_id}` atualizado para: *{new_status}*.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    except Exception as e:
-        logger.error(f"Erro ao atualizar status da OS {os_id}: {e}")
-        await query.edit_message_text(
-            f"❌ Erro ao atualizar status da OS `{os_id}`. Tente novamente.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    context.user_data.clear()
-    return MENU
-
-# --- Fluxo de Eliminação de OS ---
-
-async def delete_os_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, os_id: str) -> int:
-    """Exibe confirmação para exclusão de OS."""
-    query = update.callback_query
-    await query.answer()
-    
-    os_data = get_os_by_id(os_id)
-    if not os_data:
-        await query.edit_message_text(
-            f"❌ OS com ID `{os_id}` não encontrada.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return MENU
-        
     keyboard = [
-        [InlineKeyboardButton("⚠️ CONFIRMAR EXCLUSÃO", callback_data=f"confirm_delete_{os_id}")],
-        [InlineKeyboardButton("↩️ Voltar ao Menu (Cancelar)", callback_data="menu")]
+        [InlineKeyboardButton("🔔 Gerenciar Alerta", callback_data=f'alerta_set|{os_id}')],
+        [InlineKeyboardButton("⬅️ Menu Principal", callback_data='menu')]
     ]
     
     await query.edit_message_text(
-        f"⚠️ *Confirmação de Exclusão*\n\n"
-        f"Você tem certeza que deseja excluir a OS de ID `{os_id}`? Esta ação é irreversível.",
+        message_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
     return MENU
 
-async def confirm_delete_os(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Exclui a OS no Firebase."""
+# --- Funções de Visualização e Busca de OS ---
+
+async def prompt_os_id(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> int:
+    """Pede o ID da OS para uma ação específica."""
     query = update.callback_query
     await query.answer()
     
-    try:
-        _, _, os_id = query.data.split('_')
-    except ValueError:
-        await query.edit_message_text("❌ Erro ao processar a exclusão. Tente novamente.", reply_markup=menu_keyboard())
-        return MENU
+    context.user_data["action_os"] = action
     
-    try:
-        # 1. Excluir Alertas/Lembretes relacionados (se houver)
-        alertas_query = get_alertas_ref().where('os_id', '==', os_id).stream()
-        for alerta in alertas_query:
-            alerta.reference.delete()
-            
-        # 2. Excluir a OS principal
-        get_os_ref(os_id).delete()
+    if action == 'ver_os':
+        prompt = "Por favor, digite o *ID* da OS que você deseja *visualizar*."
+        all_os = await fetch_all_os()
+        if all_os:
+            os_list_text = "\n".join([f"`{os_id}`: {data['descricao'][:30]}..." for os_id, data in all_os.items()])
+            prompt += f"\n\n*OS Ativas:*\n{os_list_text}"
+    elif action == 'atualizar_os':
+        prompt = "Por favor, digite o *ID* da OS que você deseja *atualizar*."
+    elif action == 'deletar_os':
+        prompt = "Por favor, digite o *ID* da OS que você deseja *deletar*."
         
-        await query.edit_message_text(
-            f"✅ OS `{os_id}` e alertas relacionados excluídos com sucesso.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        logger.error(f"Erro ao excluir OS {os_id}: {e}")
-        await query.edit_message_text(
-            f"❌ Erro ao excluir OS `{os_id}`. Tente novamente.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    return MENU
-
-# --- Fluxo de Alertas da OS ---
-
-async def gerenciar_alertas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Menu para gestão de alertas associados a OS."""
-    query = update.callback_query
-    await query.answer()
-    
     await query.edit_message_text(
-        "Digite o *ID* da Ordem de Serviço (OS) para gerenciar alertas:",
+        prompt,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='menu')]]),
         parse_mode=ParseMode.MARKDOWN
     )
-    return PROMPT_ALERTA # Vai para o estado para receber o ID da OS
+    return PROMPT_OS
 
-async def select_alerta_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe o ID da OS e exibe opções de alerta (incluir/remover)."""
-    os_id = update.message.text.strip()
-    context.user_data['target_os_id'] = os_id
+async def process_os_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Processa o ID recebido e encaminha para a ação correta."""
+    os_id = update.text.strip()
+    action = context.user_data.get("action_os")
     
-    os_data = get_os_by_id(os_id)
-    
-    if not os_data:
+    os_data = await asyncio.to_thread(get_os_ref(os_id).get) if get_os_ref(os_id) else None
+    if os_data and os_data.exists:
+        os_data = os_data.to_dict()
+        os_data["id"] = os_id # Garante que o ID está no dict
+
+        if action == 'ver_os':
+            return await show_os_details(update, context, os_data)
+        elif action == 'atualizar_os':
+            context.user_data["os_temp"] = os_data
+            return await prompt_update_field(update, context)
+        elif action == 'deletar_os':
+            return await confirm_delete_os(update, context, os_id)
+        
+    else:
         await update.message.reply_text(
-            f"❌ OS com ID `{os_id}` não encontrada. Digite um ID válido ou /cancel.",
+            f"❌ OS com ID `{os_id}` não encontrada.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data='menu')]]),
             parse_mode=ParseMode.MARKDOWN
         )
-        return PROMPT_ALERTA
-        
-    context.user_data['os_data'] = os_data
+        return PROMPT_OS # Permanece no estado para nova tentativa
+
+async def show_os_details(update: Update, context: ContextTypes.DEFAULT_TYPE, os_data: dict) -> int:
+    """Exibe os detalhes de uma OS."""
+    message = format_os_message(os_data)
     
-    msg = format_os_details(os_data)
+    keyboard = [
+        [InlineKeyboardButton("🔄 Atualizar", callback_data=f'update_start|{os_data["id"]}')],
+        [InlineKeyboardButton("🔔 Gerenciar Alerta", callback_data=f'alerta_set|{os_data["id"]}')],
+        [InlineKeyboardButton("⬅️ Menu Principal", callback_data='menu')]
+    ]
     
     await update.message.reply_text(
-        f"{msg}\n\n*O que deseja fazer com o alerta desta OS?*",
-        reply_markup=alerta_options_keyboard(os_id),
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
-    return PROMPT_TIPO_INCLUSAO
+    context.user_data.pop("action_os", None)
+    return MENU
 
-async def prompt_incluir_alerta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pede a data/hora para o alerta."""
-    query = update.callback_query
-    await query.answer()
-    
-    try:
-        _, _, os_id = query.data.split('_')
-    except ValueError:
-        os_id = context.user_data.get('target_os_id', 'N/A')
-        
-    context.user_data['target_os_id'] = os_id
-    
-    await query.edit_message_text(
-        f"Você está definindo um alerta para a OS `{os_id}`.\n\n"
-        f"Por favor, **digite a data e hora do alerta** no formato *DD/MM/YYYY HH:MM* "
-        f"ou em formato relativo (ex: `+3h`, `1d`, `amanha 09:00`):",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    # Próximo estado: receber data/hora
-    # Reutiliza PROMPT_INCLUSAO para o fluxo de data -> descrição
-    return PROMPT_INCLUSAO
+# --- Funções de Atualização de OS ---
 
-async def receive_alerta_data_for_descricao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe a data do alerta e pede a descrição/mensagem."""
-    data_str = update.message.text.strip()
-    alerta_dt = parse_time_input(data_str)
+async def prompt_update_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pede ao usuário qual campo da OS deseja atualizar."""
+    os_id = context.user_data["os_temp"]["id"]
     
-    if not alerta_dt or alerta_dt <= datetime.now():
-        await update.message.reply_text(
-            "❌ *Data/hora inválida ou no passado*. Por favor, digite uma data/hora futura válida (DD/MM/YYYY HH:MM ou relativo):",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return PROMPT_INCLUSAO
-        
-    context.user_data['alerta_dt'] = alerta_dt
+    keyboard = [
+        [InlineKeyboardButton("Descrição", callback_data='update_field|descricao')],
+        [InlineKeyboardButton("Tipo", callback_data='update_field|tipo')],
+        [InlineKeyboardButton("Status", callback_data='update_field|status')],
+        [InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]
+    ]
     
     await update.message.reply_text(
-        f"Data/Hora de alerta definida para: `{alerta_dt.strftime('%d/%m/%Y %H:%M')}`.\n\n"
-        f"Agora, **digite a descrição/mensagem** do alerta (ex: 'Ligar para o cliente' ou 'Revisar estoque'):",
+        f"OS `{os_id}` selecionada. Qual campo você deseja *atualizar*?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
-    return PROMPT_INCLUSAO # Permanece no mesmo estado para receber a descrição
+    return PROMPT_ATUALIZACAO
 
-async def receive_alerta_descricao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe a descrição do alerta e salva tudo no Firestore."""
-    
-    # Esta função agora precisa diferenciar se está recebendo a data ou a descrição.
-    # O fluxo é: PROMPT_INCLUSAO (data) -> PROMPT_INCLUSAO (descrição)
-    
-    # 1. Verifica se a data do alerta já está no contexto
-    if 'alerta_dt' not in context.user_data:
-        # Se não tem data, o usuário enviou a data agora. Processa como data.
-        return await receive_alerta_data_for_descricao(update, context)
-        
-    # 2. Se a data está no contexto, o usuário enviou a descrição. Processa como descrição.
-    os_id = context.user_data.get('target_os_id')
-    alerta_dt = context.user_data.get('alerta_dt')
-    descricao = update.message.text.strip()
-    user_id = update.effective_user.id
-    
-    if not os_id or not alerta_dt:
-        await update.message.reply_text("❌ Erro interno: Dados do alerta perdidos. Tente novamente ou /cancel.", reply_markup=menu_keyboard())
-        context.user_data.clear()
-        return MENU
-        
-    try:
-        # Salva Alerta na coleção de Alertas/Lembretes
-        alerta_data = {
-            'os_id': os_id,
-            'user_id': str(user_id),
-            'chat_id': update.effective_chat.id,
-            'data_alerta': alerta_dt,
-            'descricao': descricao,
-            'tipo': 'alerta_os',
-            'ativo': True,
-            'data_criacao': firestore.SERVER_TIMESTAMP,
-        }
-        alerta_ref = get_alertas_ref().add(alerta_data)[1]
-        
-        # Atualiza a OS principal com a nova referência de alerta
-        get_os_ref(os_id).update({
-            'alerta_data': alerta_dt,
-            'alerta_descricao': descricao,
-            'alerta_ref_id': alerta_ref.id
-        })
-
-        await update.message.reply_text(
-            f"✅ *Alerta Agendado com Sucesso! (ID: {alerta_ref.id})*\n\n"
-            f"OS ID: `{os_id}`\n"
-            f"Data: `{alerta_dt.strftime('%d/%m/%Y %H:%M')}`\n"
-            f"Mensagem: {descricao}",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-        logger.error(f"Erro ao salvar alerta no Firebase: {e}")
-        await update.message.reply_text(
-            "❌ Erro ao agendar o alerta. Tente novamente.",
-            reply_markup=menu_keyboard()
-        )
-        
-    context.user_data.clear()
-    return MENU
-
-async def remover_alerta_menu_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pede o ID da OS para remover o alerta."""
+async def prompt_new_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pede o novo valor para o campo selecionado."""
     query = update.callback_query
     await query.answer()
     
-    # Se o callback veio de 'gerenciar_alerta_<os_id>', usa esse ID
-    if 'gerenciar_alerta_' in query.data:
-        _, _, os_id = query.data.split('_')
-        context.user_data['target_os_id'] = os_id
+    field = query.data.split('|')[1]
+    context.user_data["update_field"] = field
+    
+    if field == 'status':
+        keyboard = [
+            [InlineKeyboardButton("Pendente", callback_data='update_value|Pendente')],
+            [InlineKeyboardButton("Em Andamento", callback_data='update_value|Em Andamento')],
+            [InlineKeyboardButton("Concluída", callback_data='update_value|Concluída')],
+            [InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]
+        ]
         await query.edit_message_text(
-            f"Deseja remover o alerta da OS `{os_id}`?\n\n"
-            f"Se sim, confirme digitando **o ID da OS** novamente. Caso contrário, /cancel.",
+            "Selecione o novo *Status*:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
-        return PROMPT_ID_ALERTA
+        # Permanece no estado PROMPT_ATUALIZACAO, a próxima ação (update_value) fará a transição
+        return PROMPT_ATUALIZACAO
     
-    # Se veio do menu principal de alertas
-    await query.edit_message_text(
-        "Digite o *ID* da Ordem de Serviço (OS) para remover o alerta:",
-        parse_mode=ParseMode.MARKDOWN
+    elif field == 'tipo':
+        keyboard = [
+            [InlineKeyboardButton("Manutenção", callback_data='update_value|Manutenção')],
+            [InlineKeyboardButton("Instalação", callback_data='update_value|Instalação')],
+            [InlineKeyboardButton("Suporte", callback_data='update_value|Suporte')],
+            [InlineKeyboardButton("Outro", callback_data='update_value|Outro')],
+            [InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]
+        ]
+        await query.edit_message_text(
+            "Selecione o novo *Tipo*:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return PROMPT_ATUALIZACAO
+        
+    else: # Descrição
+        await query.edit_message_text(
+            f"Digite o novo valor para *{field.capitalize()}*:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return PROMPT_ATUALIZACAO
+
+async def receive_and_save_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe o novo valor (texto) e salva a atualização."""
+    # Este handler é chamado APENAS se for uma MessageHandler (ou seja, descrição)
+    
+    new_value = update.text
+    field = context.user_data.get("update_field")
+    
+    return await save_update(update, context, new_value, field)
+
+async def handle_callback_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe o novo valor (callback) e salva a atualização."""
+    # Este handler é chamado se o valor for via CallbackQuery (status ou tipo)
+    query = update.callback_query
+    await query.answer()
+    
+    # O callback data é 'update_value|NovoValor'
+    new_value = query.data.split('|')[1]
+    field = context.user_data.get("update_field")
+
+    # Chama a função de salvamento com a Update de CallbackQuery
+    return await save_update(update, context, new_value, field)
+    
+async def save_update(update: Update, context: ContextTypes.DEFAULT_TYPE, new_value: str, field: str) -> int:
+    """Função central para aplicar e salvar a atualização no Firestore."""
+    
+    os_data = context.user_data["os_temp"]
+    os_id = os_data["id"]
+
+    os_data[field] = new_value
+    os_data["ultima_atualizacao"] = datetime.now().isoformat()
+    
+    await save_os(os_data)
+    
+    # Limpa dados temporários
+    context.user_data.pop("os_temp")
+    context.user_data.pop("update_field")
+    context.user_data.pop("action_os", None)
+
+    message = (
+        f"✅ *OS `{os_id}` Atualizada!*\n"
+        f"Campo *{field.capitalize()}* atualizado para: _{new_value}_."
     )
-        
-    return PROMPT_ID_ALERTA
-
-async def receive_alerta_prazo_or_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe o ID da OS para remoção do alerta e confirma/executa."""
-    os_id = update.message.text.strip()
     
-    os_data = get_os_by_id(os_id)
+    keyboard = [
+        [InlineKeyboardButton("🔎 Ver Detalhes", callback_data=f'ver_os_id|{os_id}')],
+        [InlineKeyboardButton("⬅️ Menu Principal", callback_data='menu')]
+    ]
     
-    if not os_data:
-        await update.message.reply_text(
-            f"❌ OS com ID `{os_id}` não encontrada. Digite um ID válido ou /cancel.",
+    # Usa edit_message_text se for CallbackQuery, senão usa reply_text
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
-        return PROMPT_ID_ALERTA
-        
-    alerta_ref_id = os_data.get('alerta_ref_id')
-
-    if not alerta_ref_id:
+    else:
         await update.message.reply_text(
-            f"🤷‍♂️ A OS `{os_id}` não possui um alerta ativo associado. Voltando ao menu.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        context.user_data.clear()
-        return MENU
-
-    try:
-        # 1. Excluir o documento de alerta
-        get_alertas_ref().document(alerta_ref_id).delete()
-        
-        # 2. Remover campos de alerta da OS principal
-        get_os_ref(os_id).update({
-            'alerta_data': firestore.DELETE_FIELD,
-            'alerta_descricao': firestore.DELETE_FIELD,
-            'alerta_ref_id': firestore.DELETE_FIELD
-        })
-        
-        await update.message.reply_text(
-            f"✅ Alerta associado à OS `{os_id}` removido com sucesso.",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-        logger.error(f"Erro ao remover alerta da OS {os_id}: {e}")
-        await update.message.reply_text(
-            f"❌ Erro ao remover alerta da OS `{os_id}`. Tente novamente.",
-            reply_markup=menu_keyboard(),
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
         
-    context.user_data.clear()
     return MENU
 
-# --- Fluxo de Lembrete Manual ---
+# --- Funções de Deleção de OS ---
 
-async def lembrete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Menu para lembrete manual."""
+async def confirm_delete_os(update: Update, context: ContextTypes.DEFAULT_TYPE, os_id: str) -> int:
+    """Solicita confirmação para deletar a OS."""
+    
+    keyboard = [
+        [InlineKeyboardButton("🚨 CONFIRMAR DELEÇÃO 🚨", callback_data=f'confirm_delete_{os_id}')],
+        [InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]
+    ]
+    
+    await update.message.reply_text(
+        f"⚠️ *Atenção!* Você está prestes a deletar a OS com ID `{os_id}`.\n"
+        f"Esta ação não pode ser desfeita. Confirma a deleção?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    # Define o estado da conversa para aguardar a confirmação de deleção
+    return MENU 
+
+async def finalize_delete_os(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Executa a deleção da OS após a confirmação."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extrai o ID da OS: 'confirm_delete_OS_ID'
+    os_id = query.data.split('_')[-1]
+    
+    success = await delete_os(os_id)
+    
+    if success:
+        message = f"✅ *OS `{os_id}` e alertas associados deletados com sucesso!*"
+    else:
+        message = f"❌ *Falha ao deletar a OS `{os_id}`*. Tente novamente."
+        
+    await query.edit_message_text(
+        message,
+        reply_markup=get_main_menu_keyboard(update),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    context.user_data.pop("action_os", None)
+    return MENU
+
+# --- Funções de Alerta (Lembrete) ---
+
+async def alerta_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Exibe o menu de gestão de alertas."""
     query = update.callback_query
     await query.answer()
     
     keyboard = [
-        [InlineKeyboardButton("🗓 Agendar Novo Lembrete", callback_data="lembrete_manual_start")],
-        [InlineKeyboardButton("↩️ Voltar ao Menu", callback_data="menu")]
+        [InlineKeyboardButton("➕ Incluir Alerta em OS", callback_data='alerta_os_prompt')],
+        [InlineKeyboardButton("❌ Remover Alerta de OS", callback_data='remover_alerta_prompt')],
+        [InlineKeyboardButton("🕰️ Agendar Lembrete Manual", callback_data='lembrete_manual_start')],
+        [InlineKeyboardButton("⬅️ Menu Principal", callback_data='menu')],
     ]
     
     await query.edit_message_text(
-        "Você pode agendar um lembrete manual que será enviado para você neste chat.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "🔔 *Gestão de Alertas e Lembretes*\nEscolha uma opção:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
     )
-    return LEMBRETE_MENU
-
-async def prompt_lembrete_os_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Pede a data/hora para o lembrete manual."""
+    return PROMPT_ALERTA
+    
+async def prompt_os_id_alerta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pede o ID da OS para incluir/remover alerta."""
     query = update.callback_query
     await query.answer()
     
+    action = query.data.split('|')[0] # 'alerta_os_prompt' ou 'remover_alerta_prompt'
+    context.user_data["alerta_action"] = action
+    
+    prompt = "Por favor, digite o *ID* da OS para gerenciar o alerta:"
+    
     await query.edit_message_text(
-        f"Por favor, **digite a data e hora do lembrete** no formato *DD/MM/YYYY HH:MM* "
-        f"ou em formato relativo (ex: `+3h`, `1d`, `amanha 09:00`):",
+        prompt,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar", callback_data='alerta_menu')]]),
         parse_mode=ParseMode.MARKDOWN
     )
-    return PROMPT_LEMBRETE_DATA # Próximo estado: receber data/hora
+    return PROMPT_ID_ALERTA
+    
+async def prompt_alerta_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe o ID da OS e pede o prazo do alerta."""
+    os_id = update.text.strip()
+    action = context.user_data.get("alerta_action")
+    
+    os_ref = get_os_ref(os_id)
+    os_data = await asyncio.to_thread(os_ref.get) if os_ref else None
+
+    if not os_data or not os_data.exists:
+        await update.message.reply_text(
+            f"❌ OS com ID `{os_id}` não encontrada.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar", callback_data='alerta_menu')]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return PROMPT_ID_ALERTA # Permanece no estado para nova tentativa
+        
+    context.user_data["os_id_alerta"] = os_id
+    
+    if action == 'remover_alerta_prompt':
+        return await remove_alerta_confirm(update, context, os_data.to_dict())
+
+    # Continua para inclusão
+    await update.message.reply_text(
+        f"OS `{os_id}` encontrada. Digite a *data e hora* do alerta (Ex: 01/12/2025 10:00):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return PROMPT_INCLUSAO
+
+async def receive_alerta_descricao(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Recebe a data/hora e pede a mensagem do alerta."""
+    
+    # 1. Valida a data
+    date_str = update.text.strip()
+    try:
+        due_date = datetime.strptime(date_str, "%d/%m/%Y %H:%M")
+        if due_date <= datetime.now():
+             await update.message.reply_text(
+                "❌ A data do alerta deve ser *futura*. Tente novamente (Ex: 01/12/2025 10:00):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+             return PROMPT_INCLUSAO
+             
+        context.user_data["alerta_due_date"] = due_date
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Formato de data/hora inválido. Use o formato *DD/MM/AAAA HH:MM* (Ex: 01/12/2025 10:00):",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return PROMPT_INCLUSAO
+
+    # 2. Pede a mensagem
+    await update.message.reply_text(
+        "Digite a *mensagem* para o alerta/lembrete (Ex: Ligar para o cliente):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return PROMPT_TIPO_INCLUSAO
+
+async def save_os_alerta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Salva o alerta no Firestore e atualiza a OS."""
+    
+    alert_message = update.text.strip()
+    os_id = context.user_data.get("os_id_alerta")
+    due_date = context.user_data.get("alerta_due_date")
+    chat_id = update.effective_chat.id
+    
+    # 1. Agenda o alerta
+    alert_id = await schedule_alert(os_id, chat_id, due_date, alert_message)
+    
+    # 2. Atualiza a OS para refletir o alerta
+    os_ref = get_os_ref(os_id)
+    if os_ref:
+        await asyncio.to_thread(os_ref.update, {
+            "alerta": f"Agendado para {due_date.strftime('%d/%m/%Y %H:%M')}",
+            "alerta_id": alert_id,
+        })
+
+    # 3. Confirmação
+    message = (
+        f"🔔 *Alerta Agendado!* \n"
+        f"OS ID: `{os_id}`\n"
+        f"Para: {due_date.strftime('%d/%m/%Y %H:%M')}\n"
+        f"Mensagem: {alert_message}\n"
+    )
+
+    await update.message.reply_text(
+        message,
+        reply_markup=get_main_menu_keyboard(update),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    context.user_data.pop("os_id_alerta", None)
+    context.user_data.pop("alerta_due_date", None)
+    context.user_data.pop("alerta_action", None)
+    return MENU
+
+async def remove_alerta_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, os_data: dict) -> int:
+    """Pede confirmação para remover alerta."""
+    query_target = update.callback_query or update.message
+    os_id = os_data.get("id")
+    alerta_info = os_data.get("alerta")
+    alerta_id = os_data.get("alerta_id")
+    
+    if alerta_info == "Nenhum" or not alerta_id:
+        message = f"❌ A OS `{os_id}` não possui um alerta agendado."
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menu Alerta", callback_data='alerta_menu')]])
+    else:
+        context.user_data["alerta_id_remover"] = alerta_id
+        message = (
+            f"⚠️ Confirma a remoção do alerta agendado:\n"
+            f"*OS ID:* `{os_id}`\n"
+            f"*Detalhe:* {alerta_info}"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirmar Remoção", callback_data=f'confirm_remove_alerta')],
+            [InlineKeyboardButton("⬅️ Cancelar", callback_data='alerta_menu')]
+        ])
+
+    if update.callback_query:
+        await query_target.edit_message_text(message, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await query_target.reply_text(message, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+
+    # Não muda de estado, o callback 'confirm_remove_alerta' fará a transição
+    return PROMPT_ID_ALERTA 
+
+async def finalize_remove_alerta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Executa a remoção do alerta."""
+    query = update.callback_query
+    await query.answer()
+
+    alerta_id = context.user_data.get("alerta_id_remover")
+    os_id = context.user_data.get("os_id_alerta")
+
+    if not alerta_id or not os_id:
+        await query.edit_message_text("❌ Erro: Não foi possível identificar o alerta.", reply_markup=get_main_menu_keyboard(update))
+        return MENU
+        
+    # 1. Deleta o alerta
+    await delete_alert(alerta_id)
+    
+    # 2. Atualiza a OS
+    os_ref = get_os_ref(os_id)
+    if os_ref:
+        await asyncio.to_thread(os_ref.update, {
+            "alerta": "Nenhum",
+            "alerta_id": firestore.DELETE_FIELD, # Remove o campo alerta_id
+        })
+        
+    message = f"✅ *Alerta da OS `{os_id}` removido com sucesso!*"
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=get_main_menu_keyboard(update),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    context.user_data.pop("alerta_id_remover", None)
+    context.user_data.pop("os_id_alerta", None)
+    context.user_data.pop("alerta_action", None)
+    return MENU
+
+# --- Funções de Lembrete Manual (Agendamento avulso) ---
+
+async def start_lembrete_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inicia o fluxo de agendamento de lembrete manual."""
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "⏰ *Agendamento de Lembrete Manual*\n"
+        "Por favor, digite a *data e hora* para o lembrete (Ex: 01/12/2025 10:00):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return PROMPT_LEMBRETE_DATA
 
 async def prompt_lembrete_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe a data e pede a mensagem."""
-    data_str = update.message.text.strip()
-    lembrete_dt = parse_time_input(data_str)
+    """Recebe a data/hora e pede a mensagem do lembrete manual."""
     
-    if not lembrete_dt or lembrete_dt <= datetime.now():
+    # 1. Valida a data
+    date_str = update.text.strip()
+    try:
+        due_date = datetime.strptime(date_str, "%d/%m/%Y %H:%M")
+        if due_date <= datetime.now():
+             await update.message.reply_text(
+                "❌ A data do lembrete deve ser *futura*. Tente novamente (Ex: 01/12/2025 10:00):",
+                parse_mode=ParseMode.MARKDOWN
+            )
+             return PROMPT_LEMBRETE_DATA
+             
+        context.user_data["lembrete_due_date"] = due_date
+    except ValueError:
         await update.message.reply_text(
-            "❌ *Data/hora inválida ou no passado*. Por favor, digite uma data/hora futura válida (DD/MM/YYYY HH:MM ou relativo):",
+            "❌ Formato de data/hora inválido. Use o formato *DD/MM/AAAA HH:MM* (Ex: 01/12/2025 10:00):",
             parse_mode=ParseMode.MARKDOWN
         )
         return PROMPT_LEMBRETE_DATA
-        
-    context.user_data['lembrete_dt'] = lembrete_dt
-    
+
+    # 2. Pede a mensagem
     await update.message.reply_text(
-        f"Data/Hora de lembrete definida para: `{lembrete_dt.strftime('%d/%m/%Y %H:%M')}`.\n\n"
-        f"Agora, **digite a mensagem** do seu lembrete:",
+        "Digite a *mensagem* para o lembrete (Ex: Pagar a conta de luz):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]]),
         parse_mode=ParseMode.MARKDOWN
     )
-    return PROMPT_LEMBRETE_MSG # Próximo estado: receber a mensagem
+    return PROMPT_LEMBRETE_MSG
 
 async def save_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Recebe a mensagem e salva o lembrete manual no Firestore."""
+    """Salva o lembrete manual no Firestore."""
     
-    # 1. Obter dados do contexto
-    lembrete_dt = context.user_data.get('lembrete_dt')
-    mensagem = update.message.text.strip()
-    user_id = update.effective_user.id
+    lembrete_message = update.text.strip()
+    due_date = context.user_data.get("lembrete_due_date")
     chat_id = update.effective_chat.id
     
-    if not lembrete_dt:
-        await update.message.reply_text("❌ Erro interno: Data do lembrete perdida. Tente novamente ou /cancel.", reply_markup=menu_keyboard())
-        context.user_data.clear()
-        return MENU
-        
-    try:
-        # 2. Salvar Lembrete na coleção de Alertas/Lembretes
-        lembrete_data = {
-            'os_id': None, # Lembrete manual não tem OS associada
-            'user_id': str(user_id),
-            'chat_id': chat_id, # ID do chat para onde enviar o lembrete
-            'data_alerta': lembrete_dt,
-            'descricao': mensagem,
-            'tipo': 'lembrete_manual', # Diferencia de alertas de OS
-            'ativo': True,
-            'data_criacao': firestore.SERVER_TIMESTAMP,
-        }
-        lembrete_ref = get_alertas_ref().add(lembrete_data)[1]
+    # Agendamos o alerta com um OS ID mock 'MANUAL'
+    alert_id = await schedule_alert("MANUAL", chat_id, due_date, lembrete_message)
+    
+    message = (
+        f"✅ *Lembrete Manual Agendado!* \n"
+        f"Para: {due_date.strftime('%d/%m/%Y %H:%M')}\n"
+        f"Mensagem: {lembrete_message}\n"
+    )
 
-        await update.message.reply_text(
-            f"✅ *Lembrete Manual Agendado com Sucesso! (ID: {lembrete_ref.id})*\n\n"
-            f"Data: `{lembrete_dt.strftime('%d/%m/%Y %H:%M')}`\n"
-            f"Mensagem: {mensagem}",
-            reply_markup=menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-        logger.error(f"Erro ao salvar lembrete manual no Firebase: {e}")
-        await update.message.reply_text(
-            "❌ Erro ao agendar o lembrete. Tente novamente.",
-            reply_markup=menu_keyboard()
-        )
-        
-    context.user_data.clear()
+    await update.message.reply_text(
+        message,
+        reply_markup=get_main_menu_keyboard(update),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    context.user_data.pop("lembrete_due_date", None)
     return MENU
 
-# --- Fluxo de Exportação para PDF ---
+# --- Exportação para PDF ---
 
-async def exportar_os_para_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Gera um PDF com o status atual das OS e envia para o usuário."""
+async def exportar_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Busca todas as OS e gera um PDF para envio."""
     query = update.callback_query
-    await query.answer("Gerando relatório em PDF. Por favor, aguarde...")
+    await query.answer("Gerando PDF... Aguarde um momento.")
 
     if not PDF_PROCESSOR_AVAILABLE:
         await query.edit_message_text(
-            "❌ *Recurso indisponível*.\n\n"
-            "Os módulos `PyMuPDF` (`fitz`) e `pandas` não estão instalados. "
-            "Para ativar este recurso, instale as dependências (`requirements.txt`).",
-            reply_markup=menu_keyboard(),
+            "❌ *Recurso Indisponível.* Os módulos 'PyMuPDF' e/ou 'pandas' não estão instalados neste ambiente. Por favor, instale-os para usar esta função.",
+            reply_markup=get_main_menu_keyboard(update),
             parse_mode=ParseMode.MARKDOWN
         )
         return MENU
-        
+
     try:
-        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-        
-        # 1. Busca dados
-        ordens = get_all_os()
-        
-        if not ordens:
+        os_data = await fetch_all_os()
+        if not os_data:
             await query.edit_message_text(
-                "Nenhuma OS Ativa para exportar.",
-                reply_markup=menu_keyboard()
+                "⚠️ Não há Ordens de Serviço (OS) cadastradas para exportar.",
+                reply_markup=get_main_menu_keyboard(update),
+                parse_mode=ParseMode.MARKDOWN
             )
             return MENU
-            
-        # Prepara dados para o DataFrame
+
+        # Cria a lista de dicionários para o DataFrame
         data_for_df = []
-        for os in ordens:
-            # Converte data_criacao do Firestore Timestamp (ou datetime) para string
-            data_criacao_ts = os.get('data_criacao')
-            if hasattr(data_criacao_ts, 'seconds'):
-                data_criacao_str = datetime.fromtimestamp(data_criacao_ts.seconds).strftime("%d/%m/%Y %H:%M")
-            elif isinstance(data_criacao_ts, datetime):
-                data_criacao_str = data_criacao_ts.strftime("%d/%m/%Y %H:%M")
-            else:
-                data_criacao_str = "N/A"
-            
-            # Converte alerta_data (se existir)
-            alerta_ts = os.get('alerta_data')
-            alerta_str = ""
-            if alerta_ts:
-                if hasattr(alerta_ts, 'seconds'):
-                    alerta_str = datetime.fromtimestamp(alerta_ts.seconds).strftime("%d/%m/%Y %H:%M")
-                elif isinstance(alerta_ts, datetime):
-                    alerta_str = alerta_ts.strftime("%d/%m/%Y %H:%M")
-            
+        for os_id, data in os_data.items():
             data_for_df.append({
-                "ID": os['id'],
-                "Descrição": os.get('descricao', 'N/A')[:100].replace('\n', ' ') + '...',
-                "Tipo": os.get('tipo', 'N/A'),
-                "Status": os.get('status', 'N/A'),
-                "Data Criação": data_criacao_str,
-                "Alerta": alerta_str,
+                'ID': os_id,
+                'Descrição': data.get('descricao', 'N/A'),
+                'Tipo': data.get('tipo', 'N/A'),
+                'Status': data.get('status', 'N/A'),
+                'Data Criação': data.get('data_criacao', 'N/A').split('T')[0], # Simplifica data
+                'Alerta': data.get('alerta', 'Nenhum'),
             })
-            
+
         df = pd.DataFrame(data_for_df)
         
-        # 2. Gera o PDF (usando PyMuPDF)
+        # --- Geração do PDF usando PyMuPDF (fitz) ---
+        
+        # 1. Configuração do Documento
         doc = fitz.open()
-        page = doc.new_page()
+        page = doc.new_page(width=595, height=842) # A4 size
         
-        y_cursor = 50
-        x_start = 30
-        line_height = 15
+        # 2. Título
+        page.insert_text((50, 50), "Relatório de Ordens de Serviço", fontsize=18, color=(0, 0, 0))
+        page.insert_text((50, 75), f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", fontsize=10, color=(0.5, 0.5, 0.5))
         
-        # Título
-        page.insert_text((x_start, y_cursor), "Relatório de Ordens de Serviço Ativas", fontname="helv-bold", fontsize=16)
-        y_cursor += line_height * 2
+        # 3. Tabela (usando CSV temporário para layout simples)
+        csv_buffer = io.StringIO()
+        # Formata o CSV para que a descrição não tenha quebras de linha
+        df.to_csv(csv_buffer, index=False, sep=';') 
+        csv_text = csv_buffer.getvalue()
         
-        # Data de Geração
-        page.insert_text((x_start, y_cursor), f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", fontname="helv", fontsize=10)
-        y_cursor += line_height * 2
+        text_y = 100
+        text_x = 50
         
-        # Tabela (ajustada para um layout simples)
+        # Desenha as linhas da tabela (simplificado, aqui apenas texto)
+        header = csv_text.split('\n')[0].split(';')
         
-        headers = ["ID", "Tipo", "Status", "Data Criação", "Alerta"]
-        # Larguras ajustadas para caber
-        col_widths = [100, 80, 100, 100, 100]
-        
-        # Headers
-        x_current = x_start
-        for header, width in zip(headers, col_widths):
-            page.insert_text((x_current, y_cursor), header, fontname="helv-bold", fontsize=10)
-            x_current += width
-        y_cursor += line_height
-        
-        # Linhas de dados
-        for index, row in df.iterrows():
-            if y_cursor > page.rect.height - 50: # Quebra de página
-                page = doc.new_page()
-                y_cursor = 50
-                x_current = x_start
-                # Reinsere headers
-                for header, width in zip(headers, col_widths):
-                    page.insert_text((x_current, y_cursor), header, fontname="helv-bold", fontsize=10)
-                    x_current += width
-                y_cursor += line_height
+        # Desenha cabeçalho
+        col_widths = [100, 200, 80, 80, 80, 50]
+        current_x = text_x
+        for i, h in enumerate(header):
+            page.insert_text((current_x, text_y), h, fontsize=9, color=(0, 0, 0), fontname="helv-bold")
+            current_x += col_widths[i]
 
-            x_current = x_start
-            data_row = [row['ID'][:10], row['Tipo'], row['Status'], row['Data Criação'], row['Alerta']]
-            for data, width in zip(data_row, col_widths):
-                page.insert_text((x_current, y_cursor), str(data), fontname="helv", fontsize=9)
-                x_current += width
-            y_cursor += line_height
-
-        # 3. Salva o PDF em buffer de memória
-        pdf_bytes = doc.tobytes()
+        text_y += 15
+        
+        # Desenha linhas de dados
+        for line in csv_text.split('\n')[1:]:
+            if not line.strip(): continue
+            cols = line.split(';')
+            current_x = text_x
+            
+            # Nova página se o texto exceder o limite
+            if text_y > 800:
+                page = doc.new_page(width=595, height=842)
+                text_y = 50
+                # Redesenha o cabeçalho na nova página
+                current_x = text_x
+                for i, h in enumerate(header):
+                    page.insert_text((current_x, text_y), h, fontsize=9, color=(0, 0, 0), fontname="helv-bold")
+                    current_x += col_widths[i]
+                text_y += 15
+                current_x = text_x
+            
+            for i, col_data in enumerate(cols):
+                # Limita o tamanho do texto para caber na coluna
+                display_text = col_data.replace('"', '').strip()
+                if len(display_text) > col_widths[i] // 5: # Estimativa simples
+                    display_text = display_text[:col_widths[i] // 5 - 3] + "..."
+                    
+                page.insert_text((current_x, text_y), display_text, fontsize=8, color=(0, 0, 0))
+                current_x += col_widths[i]
+            
+            text_y += 15
+        
+        # 4. Salva o PDF no buffer
+        pdf_buffer = io.BytesIO(doc.tobytes())
+        pdf_buffer.seek(0)
         doc.close()
-        
-        # 4. Envia o arquivo
-        bio = io.BytesIO(pdf_bytes)
-        bio.name = f"Relatorio_OS_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        
+
+        # 5. Envia o PDF
         await context.bot.send_document(
             chat_id=query.message.chat_id,
-            document=InputFile(bio),
-            caption=f"✅ Relatório de {len(ordens)} Ordens de Serviço Ativas gerado com sucesso."
+            document=InputFile(pdf_buffer, filename=f"relatorio_os_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"),
+            caption="✅ Relatório de Ordens de Serviço exportado com sucesso."
         )
         
-        await query.edit_message_text(
-            "Relatório PDF enviado! O Menu Principal está abaixo:",
-            reply_markup=menu_keyboard()
+        await query.delete_message()
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Escolha outra opção:",
+            reply_markup=get_main_menu_keyboard(update)
         )
 
     except Exception as e:
-        logger.error(f"Erro ao gerar/enviar PDF: {e}")
+        logger.error(f"Erro ao gerar ou enviar PDF: {e}")
         await query.edit_message_text(
-            "❌ Erro ao processar o relatório PDF. Verifique o log do servidor.",
-            reply_markup=menu_keyboard()
+            f"❌ Ocorreu um erro ao gerar o PDF. Detalhes: {e}",
+            reply_markup=get_main_menu_keyboard(update)
         )
-        
+
     return MENU
 
-# --- Job Queue e Lógica de Agendamento ---
+# --- Callbacks Genéricos ---
 
-async def check_alertas_and_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Função agendada que verifica alertas/lembretes vencidos no Firestore e os envia.
-    """
-    logger.info("Executando verificação de alertas e lembretes agendados...")
-    now = datetime.now()
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Gerencia callbacks que fazem transições de estado ou chamam funções auxiliares."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extrai o comando
+    data = query.data
+    
+    if data == 'menu':
+        return await start(update, context)
+
+    # Fluxo de OS
+    elif data == 'menu|nova_os':
+        return await prompt_os_description(update, context)
+    elif data == 'menu|ver_os':
+        return await prompt_os_id(update, context, 'ver_os')
+    elif data.startswith('ver_os_id|'):
+        os_id = data.split('|')[1]
+        os_ref = get_os_ref(os_id)
+        if os_ref:
+            os_data = await asyncio.to_thread(os_ref.get)
+            if os_data.exists:
+                os_data_dict = os_data.to_dict()
+                os_data_dict["id"] = os_id
+                return await show_os_details(Update(update_id=update.update_id, callback_query=query), context, os_data_dict)
+        
+        await query.edit_message_text(f"❌ OS com ID `{os_id}` não encontrada.", reply_markup=get_main_menu_keyboard(update), parse_mode=ParseMode.MARKDOWN)
+        return MENU
+        
+    elif data == 'menu|atualizar_os':
+        return await prompt_os_id(update, context, 'atualizar_os')
+    elif data.startswith('update_start|'):
+        os_id = data.split('|')[1]
+        os_ref = get_os_ref(os_id)
+        if os_ref:
+            os_data = await asyncio.to_thread(os_ref.get)
+            if os_data.exists:
+                os_data_dict = os_data.to_dict()
+                os_data_dict["id"] = os_id
+                context.user_data["os_temp"] = os_data_dict
+                return await prompt_update_field(Update(update_id=update.update_id, callback_query=query), context)
+        
+        await query.edit_message_text(f"❌ OS com ID `{os_id}` não encontrada.", reply_markup=get_main_menu_keyboard(update), parse_mode=ParseMode.MARKDOWN)
+        return MENU
+        
+    elif data.startswith('update_field|'):
+        return await prompt_new_value(update, context)
+    elif data.startswith('update_value|'):
+        return await handle_callback_update(update, context)
+
+    elif data == 'menu|deletar_os':
+        return await prompt_os_id(update, context, 'deletar_os')
+    elif data.startswith('confirm_delete_'):
+        return await finalize_delete_os(update, context)
+        
+    # Fluxo de Alerta
+    elif data == 'menu|alerta_menu':
+        return await alerta_menu(update, context)
+    elif data == 'alerta_os_prompt' or data == 'remover_alerta_prompt':
+        return await prompt_os_id_alerta(update, context)
+    elif data.startswith('alerta_set|'):
+        os_id = data.split('|')[1]
+        os_ref = get_os_ref(os_id)
+        if os_ref:
+            os_data = await asyncio.to_thread(os_ref.get)
+            if os_data.exists:
+                context.user_data["os_id_alerta"] = os_id
+                context.user_data["alerta_action"] = 'alerta_os_prompt'
+                # Simula a transição como se o ID tivesse sido digitado
+                return await update.callback_query.edit_message_text(
+                    f"OS `{os_id}` encontrada. Digite a *data e hora* do alerta (Ex: 01/12/2025 10:00):",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancelar", callback_data='menu')]]),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        
+        await query.edit_message_text(f"❌ OS com ID `{os_id}` não encontrada.", reply_markup=get_main_menu_keyboard(update), parse_mode=ParseMode.MARKDOWN)
+        return MENU
+        
+    elif data == 'confirm_remove_alerta':
+        return await finalize_remove_alerta(update, context)
+
+    # Fluxo de Lembrete Manual
+    elif data == 'lembrete_manual_start':
+        return await start_lembrete_manual(update, context)
+        
+    # Exportação
+    elif data == 'menu|exportar_pdf':
+        return await exportar_pdf(update, context)
+
+    # Catch-all
+    else:
+        logger.warning(f"Callback não tratado: {data}")
+        await query.edit_message_text("Opção inválida. Voltando ao menu principal.", reply_markup=get_main_menu_keyboard(update))
+        return MENU
+
+async def fallback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Responde a comandos não reconhecidos em estados de conversa."""
+    await update.message.reply_text(
+        "Comando não reconhecido. Use /cancel ou escolha uma opção do menu.",
+        reply_markup=get_main_menu_keyboard(update)
+    )
+    return MENU
+
+# --- Tarefa de Agendamento (Job Queue) ---
+
+async def alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Verifica e dispara alertas pendentes do Firestore."""
+    
+    db = get_db()
+    if db is None:
+        # Se o Firebase falhou, apenas retorna
+        return
+
+    # Busca alertas pendentes com data de vencimento até o momento atual
+    now_iso = datetime.now().isoformat()
     
     try:
-        # Busca todos os alertas ativos (onde 'ativo' == True)
-        # O filtro de data é feito localmente, pois o Firestore não suporta o operador '<' sem índice
-        # e a ordem da query.
-        alertas_stream = get_alertas_ref().where('ativo', '==', True).stream()
+        # Nota: O Firestore não permite consultas "menor ou igual a" em campos de data/hora
+        # sem um índice, mas a busca por um grande intervalo é geralmente suficiente
+        # Usamos uma consulta simples para buscar todos os 'pending' e filtramos em memória para precisão
         
-        for alerta_doc in alertas_stream:
-            alerta = alerta_doc.to_dict()
-            data_alerta_ts = alerta.get('data_alerta')
-            
-            if not data_alerta_ts:
-                alerta_doc.reference.update({'ativo': False})
-                continue
+        alerts_ref = db.collection("alertas")
+        query = alerts_ref.where("status", "==", "pending").stream()
 
-            # Converte Firestore Timestamp para objeto datetime
-            if hasattr(data_alerta_ts, 'seconds'):
-                data_alerta_dt = datetime.fromtimestamp(data_alerta_ts.seconds)
-            elif isinstance(data_alerta_ts, datetime):
-                data_alerta_dt = data_alerta_ts
-            else:
-                logger.warning(f"Tipo de data inesperado para alerta {alerta_doc.id}: {type(data_alerta_ts)}")
-                alerta_doc.reference.update({'ativo': False})
-                continue
-            
-            # Checa se o alerta/lembrete já passou
-            if data_alerta_dt <= now:
-                chat_id = alerta.get('chat_id')
-                descricao = alerta.get('descricao')
-                os_id = alerta.get('os_id')
-                tipo = alerta.get('tipo', 'alerta_os')
-
-                if tipo == 'alerta_os':
-                    mensagem = f"🔔 *ALERTA DE OS VENCIDO!* (ID: `{os_id}`)\n\n"
-                    mensagem += f"Descrição do Alerta: *{descricao}*\n"
-                    mensagem += f"Data Agendada: `{data_alerta_dt.strftime('%d/%m/%Y %H:%M')}`"
-                    os_data = get_os_by_id(os_id)
-                    if os_data:
-                        mensagem += f"\nStatus Atual da OS: *{os_data['status']}*"
-                        
-                    # Remove campos de alerta da OS (limpeza)
-                    try:
-                        get_os_ref(os_id).update({
-                            'alerta_data': firestore.DELETE_FIELD,
-                            'alerta_descricao': firestore.DELETE_FIELD,
-                            'alerta_ref_id': firestore.DELETE_FIELD
-                        })
-                    except Exception as e:
-                        logger.error(f"Erro ao limpar campos de alerta na OS {os_id}: {e}")
-
-                else: # Lembrete manual
-                    mensagem = f"🗓 *LEMBRETE MANUAL!* (ID: `{alerta_doc.id}`)\n\n"
-                    mensagem += f"Mensagem: *{descricao}*\n"
-                    mensagem += f"Data Agendada: `{data_alerta_dt.strftime('%d/%m/%Y %H:%M')}`"
+        for doc in query:
+            alert_data = doc.to_dict()
+            try:
+                due_date = datetime.fromisoformat(alert_data["due_date"])
+                
+                if due_date <= datetime.now():
+                    # Disparar o Alerta
+                    chat_id = alert_data["chat_id"]
+                    os_id = alert_data["os_id"]
+                    message = alert_data["message"]
                     
-                # Envia a mensagem
-                try:
-                    if chat_id:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=mensagem,
-                            parse_mode=ParseMode.MARKDOWN
+                    if os_id == "MANUAL":
+                        alert_text = f"⏰ *Lembrete Manual:* {message}"
+                    else:
+                        alert_text = (
+                            f"🔔 *ALERTA OS:* Lembrete para a OS `{os_id}`.\n"
+                            f"Mensagem: {message}"
                         )
-                except Exception as e:
-                    logger.error(f"Falha ao enviar mensagem de alerta para chat {chat_id}: {e}")
 
-                # Desativa o alerta no Firestore
-                try:
-                    alerta_doc.reference.update({'ativo': False})
-                    logger.info(f"Alerta/Lembrete {alerta_doc.id} desativado.")
-                except Exception as e:
-                    logger.error(f"Erro ao desativar alerta {alerta_doc.id}: {e}")
+                    await context.bot.send_message(
+                        chat_id=chat_id, 
+                        text=alert_text, 
+                        parse_mode=ParseMode.MARKDOWN
+                    )
 
+                    # Atualizar o status para 'sent' no Firestore
+                    await asyncio.to_thread(doc.reference.update, {"status": "sent", "sent_at": now_iso})
+                    
+            except Exception as e:
+                logger.error(f"Erro ao processar alerta {doc.id}: {e}")
+                
     except Exception as e:
-        logger.error(f"Erro na Job Queue: {e}")
+        logger.error(f"Erro geral no job de alerta: {e}")
 
-# --- Webhook Keep-Alive ---
+# --- Função de Manutenção (Keep Alive) ---
 
-async def keep_alive(context: ContextTypes.DEFAULT_TYPE):
-    """Envia uma requisição HTTP para a própria URL do webhook para mantê-lo ativo."""
-    if WEBHOOK_URL and TOKEN:
-        full_url = WEBHOOK_URL + WEBHOOK_PATH
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(full_url) as response:
-                    logger.info(f"Keep-alive enviado para {full_url}. Status: {response.status}")
-        except Exception as e:
-            logger.error(f"Erro no Keep-Alive: {e}")
-
-# --- Main ---
-
-def run_bot() -> None:
-    """Inicia o bot e configura o Webhook ou Long Polling."""
+async def keep_alive_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Envia um ping periódico para manter o serviço Render ativo."""
     
+    # Use a URL externa para o ping
+    ping_url = WEBHOOK_URL
+    if not ping_url:
+        logger.warning("WEBHOOK_URL/RENDER_EXTERNAL_URL não definido. Não é possível enviar ping de keep-alive.")
+        return
+
+    try:
+        # Usamos aiohttp para uma requisição assíncrona leve
+        async with aiohttp.ClientSession() as session:
+            # Pingamos a URL base (Render)
+            async with session.get(ping_url) as response:
+                if response.status not in (200, 404): # 404 é normal se a rota base não existir
+                    logger.warning(f"Keep-Alive: Ping para {ping_url} retornou status {response.status}")
+                # else: Sucesso silencioso
+    except Exception as e:
+        logger.error(f"Keep-Alive: Falha ao enviar ping para {ping_url}: {e}")
+
+# --- Função Principal ---
+
+def run_bot():
+    """Configura e executa o bot em modo Webhook ou Long Polling."""
+
     if not TOKEN:
-        logger.error("O Token do Telegram não foi carregado. Finalizando.")
+        logger.error("TOKEN do Telegram não encontrado. Defina a variável TELEGRAM_TOKEN.")
         return
         
     # 1. Cria a Aplicação
     application = Application.builder().token(TOKEN).build()
     
-    # 2. Configura a JobQueue
-    job_queue: JobQueue = application.job_queue
-
-    # Agenda a verificação de alertas para rodar a cada 60 segundos
-    job_queue.run_repeating(check_alertas_and_reminders, interval=60, first=0, name="alert_checker")
+    # 2. Configuração do Job Queue (Agendamento)
+    # Executa o job de alerta a cada 1 minuto
+    application.job_queue.run_repeating(alert_job, interval=timedelta(minutes=1), first=1) 
     
-    # Agenda o keep-alive para rodar a cada 5 minutos
-    job_queue.run_repeating(keep_alive, interval=300, first=300, name="keep_alive")
+    # Executa o job de Keep Alive a cada 10 minutos (pode ser ajustado)
+    application.job_queue.run_repeating(keep_alive_ping, interval=timedelta(minutes=10), first=1)
 
-
-    # 3. Configura o ConversationHandler
+    # 3. Configuração do Conversation Handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
-        
         states={
             MENU: [
-                CallbackQueryHandler(criar_os, pattern='^criar_os$'),
-                CallbackQueryHandler(ver_ativas, pattern='^ver_ativas$'),
-                CallbackQueryHandler(atualizar_status_os, pattern='^atualizar_status_os$'),
-                CallbackQueryHandler(gerenciar_alertas_menu, pattern='^gerenciar_alertas_menu$'),
-                CallbackQueryHandler(lembrete_menu, pattern='^lembrete_menu$'),
-                CallbackQueryHandler(exportar_os_para_pdf, pattern='^exportar_pdf$'),
+                CallbackQueryHandler(callback_handler, pattern='^menu|'),
+                CallbackQueryHandler(callback_handler, pattern='^lembrete_manual_start$'),
             ],
-            
-            # Fluxo de Criação de OS
             PROMPT_DESCRICAO: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_descricao),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_os_description),
             ],
             PROMPT_TIPO: [
-                CallbackQueryHandler(receive_tipo, pattern='^tipo_'),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
+                CallbackQueryHandler(callback_handler, pattern='^os_tipo|'),
             ],
-            
-            # Fluxo de Atualização de Status
-            PROMPT_OS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_update_status),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
+            PROMPT_OS: [ # Para ver, atualizar, deletar
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_os_id),
             ],
-            PROMPT_STATUS: [
-                CallbackQueryHandler(set_new_status, pattern='^set_status_'),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
+            PROMPT_ATUALIZACAO: [
+                CallbackQueryHandler(callback_handler, pattern='^update_field|'), # Pede novo valor
+                CallbackQueryHandler(callback_handler, pattern='^update_value|'), # Recebe valor (Status/Tipo)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_and_save_update), # Recebe valor (Descrição)
             ],
-
-            # Fluxo de Gestão de Alertas
             PROMPT_ALERTA: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, select_alerta_action),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
-            ],
-            PROMPT_TIPO_INCLUSAO: [
-                CallbackQueryHandler(prompt_incluir_alerta, pattern='^incluir_alerta_'),
-                CallbackQueryHandler(remover_alerta_menu_start, pattern='^remover_alerta_'),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
-            ],
-            PROMPT_INCLUSAO: [
-                # Recebe a data OU a descrição
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_alerta_descricao), 
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
+                CallbackQueryHandler(callback_handler, pattern='^alerta_os_prompt$'),
+                CallbackQueryHandler(callback_handler, pattern='^remover_alerta_prompt$'),
+                CallbackQueryHandler(callback_handler, pattern='^lembrete_manual_start$'), # Volta para o fluxo manual
             ],
             PROMPT_ID_ALERTA: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_alerta_prazo_or_id),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_alerta_data),
+                CallbackQueryHandler(callback_handler, pattern='^confirm_remove_alerta$'), # Confirma remoção
+                CallbackQueryHandler(callback_handler, pattern='^alerta_menu$'),
             ],
-            
+            PROMPT_INCLUSAO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_alerta_descricao), # Recebe Data/Hora
+            ],
+            PROMPT_TIPO_INCLUSAO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_os_alerta), # Recebe Mensagem
+            ],
             # Fluxo de Lembrete Manual
-            LEMBRETE_MENU: [
-                CallbackQueryHandler(callback_handler, pattern='^lembrete_manual_start$'),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
-            ],
-            PROMPT_LEMBRETE_DATA: [
+            PROMPT_LEMBRETE_DATA: [ # Recebe a data
                 MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_lembrete_msg),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
             ],
-            PROMPT_LEMBRETE_MSG: [
+            PROMPT_LEMBRETE_MSG: [ # Recebe a mensagem
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_lembrete),
-                CallbackQueryHandler(callback_handler, pattern='^menu$'),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(menu_callback, pattern='^menu$'),
-            CallbackQueryHandler(confirm_delete_os, pattern='^confirm_delete_'),
             MessageHandler(filters.COMMAND, fallback_command),
+            CallbackQueryHandler(callback_handler, pattern='^menu$'), # Última chance para voltar ao menu
         ],
     )
 
@@ -1319,25 +1335,32 @@ def run_bot() -> None:
     
     # 4. Configuração do Webhook
     if WEBHOOK_URL:
+        # CORREÇÃO CRÍTICA PARA O WEBHOOK:
+        # A URL deve ser resolúvel publicamente. Se a configuração estiver correta 
+        # (WEBHOOK_URL = domínio do Render), o set_webhook funcionará.
+        full_webhook_url = WEBHOOK_URL + WEBHOOK_PATH
+        
         try:
-            # Define a URL do webhook no Telegram
             logger.info(f"A iniciar Webhook em http://0.0.0.0:{PORT}{WEBHOOK_PATH}")
+            logger.info(f"URL completa do Webhook enviada ao Telegram: {full_webhook_url}")
+            
             application.run_webhook(
                 listen="0.0.0.0",
                 port=PORT,
                 url_path=TOKEN, 
-                webhook_url=WEBHOOK_URL + WEBHOOK_PATH, 
+                webhook_url=full_webhook_url, 
             )
             logger.info(f"Servidor Webhook iniciado e escutando na porta {PORT}.")
-            logger.info(f"Webhook URL configurada no Telegram: {WEBHOOK_URL + WEBHOOK_PATH}")
+            logger.info(f"Webhook URL configurada com sucesso no Telegram: {full_webhook_url}")
+
         except Exception as e:
             logger.error(f"Falha ao iniciar o Webhook: {e}")
             logger.info("Tentando modo Long Polling (desativar para produção em infraestrutura Webhook).")
-            # Fallback para Long Polling (para debug ou ambientes sem suporte a webhook)
+            # Fallback para Long Polling
             application.run_polling(allowed_updates=Update.ALL_TYPES)
     else:
         # Se WEBHOOK_URL não estiver configurado, usa Long Polling
-        logger.info("WEBHOOK_URL não definida. Iniciando em modo Long Polling.")
+        logger.info("WEBHOOK_URL/RENDER_EXTERNAL_URL não configurado. Iniciando em modo Long Polling.")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
